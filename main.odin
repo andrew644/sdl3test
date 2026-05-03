@@ -1,13 +1,17 @@
 package main
 
+import "base:runtime"
 import "core:c"
-import "core:fmt"
 import "core:os"
 import "core:strings"
 import sdl "vendor:sdl3"
 
 device: ^sdl.GPUDevice
 window: ^sdl.Window
+pipeline: ^sdl.GPUGraphicsPipeline
+
+frag_shader_code := #load("shader.spv.frag")
+vert_shader_code := #load("shader.spv.vert")
 
 main :: proc() {
 	c_args := make([]cstring, len(os.args))
@@ -33,6 +37,7 @@ main :: proc() {
 
 @(export)
 SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> sdl.AppResult {
+	context = runtime.default_context()
 	meta_ok := sdl.SetAppMetadata("Snake", "0.1", "snake in odin")
 	sdl_ok := sdl.Init({.VIDEO, .EVENTS})
 	if !meta_ok || !sdl_ok {
@@ -46,7 +51,7 @@ SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> s
 		return .FAILURE
 	}
 
-	device = sdl.CreateGPUDevice({.SPIRV, .DXIL, .MSL}, false, nil)
+	device = sdl.CreateGPUDevice({.SPIRV}, false, nil)
 	if device == nil {
 		return .FAILURE
 	}
@@ -56,6 +61,27 @@ SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> s
 		sdl.Log("Failed to bind GPU to window: %s", sdl.GetError())
 		return .FAILURE
 	}
+
+	vert_shader := load_shader(vert_shader_code, .VERTEX)
+	frag_shader := load_shader(frag_shader_code, .FRAGMENT)
+
+	pipeline = sdl.CreateGPUGraphicsPipeline(
+		device,
+		{
+			vertex_shader = vert_shader,
+			fragment_shader = frag_shader,
+			primitive_type = .TRIANGLELIST,
+			target_info = {
+				num_color_targets = 1,
+				color_target_descriptions = &(sdl.GPUColorTargetDescription {
+						format = sdl.GetGPUSwapchainTextureFormat(device, window),
+					}),
+			},
+		},
+	)
+
+	sdl.ReleaseGPUShader(device, vert_shader)
+	sdl.ReleaseGPUShader(device, frag_shader)
 
 	return .CONTINUE
 
@@ -135,28 +161,26 @@ SDL_AppIterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		return .FAILURE
 	}
 
-	swapchainTexure: ^sdl.GPUTexture
-	if sdl.WaitAndAcquireGPUSwapchainTexture(cmdBuf, window, &swapchainTexure, nil, nil) == false {
+	swapchain_texure: ^sdl.GPUTexture
+	if sdl.WaitAndAcquireGPUSwapchainTexture(cmdBuf, window, &swapchain_texure, nil, nil) ==
+	   false {
 		sdl.Log("Wait for swapchainTexture: %s", sdl.GetError())
 		return .FAILURE
 	}
 
-	if swapchainTexure != nil {
-		clearColor: sdl.FColor
-		clearColor.r = .2
-		clearColor.g = .2
-		clearColor.b = .2
-		clearColor.a = 1
+	if swapchain_texure != nil {
 		targetInfo := sdl.GPUColorTargetInfo {
-			texture     = swapchainTexure,
+			texture     = swapchain_texure,
 			cycle       = true,
-			load_op     = sdl.GPULoadOp.CLEAR,
-			store_op    = sdl.GPUStoreOp.STORE,
-			clear_color = clearColor,
+			load_op     = .CLEAR,
+			store_op    = .STORE,
+			clear_color = {.2, .2, .4, 1},
 		}
 
-		renderPass := sdl.BeginGPURenderPass(cmdBuf, &targetInfo, 1, nil)
-		sdl.EndGPURenderPass(renderPass)
+		render_pass := sdl.BeginGPURenderPass(cmdBuf, &targetInfo, 1, nil)
+		sdl.BindGPUGraphicsPipeline(render_pass, pipeline)
+		sdl.DrawGPUPrimitives(render_pass, 3, 1, 0, 0)
+		sdl.EndGPURenderPass(render_pass)
 	}
 
 	if sdl.SubmitGPUCommandBuffer(cmdBuf) == false {
@@ -180,4 +204,17 @@ SDL_AppQuit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	}
 
 	sdl.Quit()
+}
+
+load_shader :: proc(code: []u8, stage: sdl.GPUShaderStage) -> ^sdl.GPUShader {
+	return sdl.CreateGPUShader(
+		device,
+		{
+			code_size = len(code),
+			code = raw_data(code),
+			entrypoint = "main",
+			format = {.SPIRV},
+			stage = stage,
+		},
+	)
 }
