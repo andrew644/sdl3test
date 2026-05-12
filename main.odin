@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import "core:c"
+import "core:math/linalg"
 import "core:os"
 import "core:strings"
 import sdl "vendor:sdl3"
@@ -9,6 +10,16 @@ import sdl "vendor:sdl3"
 device: ^sdl.GPUDevice
 window: ^sdl.Window
 pipeline: ^sdl.GPUGraphicsPipeline
+
+proj: matrix[4, 4]f32
+
+UBO :: struct {
+	mvp: matrix[4, 4]f32,
+}
+
+rotation: f32 = 0.0
+
+delta_time: f32 = 0.001
 
 frag_shader_code := #load("shader.spv.frag")
 vert_shader_code := #load("shader.spv.vert")
@@ -62,8 +73,8 @@ SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> s
 		return .FAILURE
 	}
 
-	vert_shader := load_shader(vert_shader_code, .VERTEX)
-	frag_shader := load_shader(frag_shader_code, .FRAGMENT)
+	vert_shader := load_shader(vert_shader_code, .VERTEX, 1)
+	frag_shader := load_shader(frag_shader_code, .FRAGMENT, 0)
 
 	pipeline = sdl.CreateGPUGraphicsPipeline(
 		device,
@@ -83,56 +94,12 @@ SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> s
 	sdl.ReleaseGPUShader(device, vert_shader)
 	sdl.ReleaseGPUShader(device, frag_shader)
 
+	win_size: [2]i32
+	sdl.GetWindowSize(window, &win_size.x, &win_size.y)
+
+	proj = linalg.matrix4_perspective_f32(70, f32(win_size.x) / f32(win_size.y), 0.0001, 1000)
+
 	return .CONTINUE
-
-	/*
-	fps_cap_enabled := true
-	fps_target := 60
-	fps: f64
-
-	main_loop: for {
-		frame_start := sdl.GetTicksNS()
-
-		for event: sdl.Event; sdl.PollEvent(&event); {
-			#partial switch event.type {
-			case .QUIT:
-				break main_loop
-			case .WINDOW_CLOSE_REQUESTED:
-				break main_loop
-			case .KEY_DOWN:
-				switch event.key.key {
-				case sdl.K_ESCAPE:
-					break main_loop
-				case sdl.K_Q:
-					break main_loop
-				}
-			}
-		}
-
-		sdl.SetRenderDrawColorFloat(renderer, .2, .2, .2, 1)
-		sdl.RenderClear(renderer)
-
-		sdl.SetRenderDrawColorFloat(renderer, .8, .3, .8, 1)
-		sdl.RenderDebugText(renderer, 10, 10, fmt.ctprintf("%-16s%.2f", "FPS Current:", fps))
-
-		free_all(context.temp_allocator)
-
-		sdl.RenderPresent(renderer)
-
-		frame_end := sdl.GetTicksNS()
-
-		// Cap fps if enabled
-		npf_target := u64(1_000_000_000 / fps_target) // nanoseconds per frame target
-		if fps_cap_enabled && (frame_end - frame_start) < npf_target {
-			sleep_time := npf_target - (frame_end - frame_start)
-			sdl.DelayPrecise(sleep_time)
-			frame_end = sdl.GetTicksNS() // Update frame_end counter to include sleep_time for fps calculation
-		}
-
-		// update fps tracker
-		fps = 1_000_000_000.0 / f64(frame_end - frame_start)
-	}
-	*/
 }
 
 @(export)
@@ -155,6 +122,7 @@ SDL_AppEvent :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult 
 
 @(export)
 SDL_AppIterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
+	frame_start := sdl.GetTicksNS()
 	cmdBuf := sdl.AcquireGPUCommandBuffer(device)
 	if cmdBuf == nil {
 		sdl.Log("Failed to get command buffer: %s", sdl.GetError())
@@ -177,8 +145,18 @@ SDL_AppIterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 			clear_color = {.2, .2, .4, 1},
 		}
 
+		rotation += delta_time * linalg.to_radians(f32(90))
+		model_mat :=
+			linalg.matrix4_translate_f32({0, 0, -5}) *
+			linalg.matrix4_rotate_f32(rotation, {0, 1, 0})
+
+		ubo := UBO {
+			mvp = proj * model_mat,
+		}
+
 		render_pass := sdl.BeginGPURenderPass(cmdBuf, &targetInfo, 1, nil)
 		sdl.BindGPUGraphicsPipeline(render_pass, pipeline)
+		sdl.PushGPUVertexUniformData(cmdBuf, 0, &ubo, size_of(ubo))
 		sdl.DrawGPUPrimitives(render_pass, 3, 1, 0, 0)
 		sdl.EndGPURenderPass(render_pass)
 	}
@@ -187,6 +165,17 @@ SDL_AppIterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		sdl.Log("Submit command buffer: %s", sdl.GetError())
 		return .FAILURE
 	}
+
+	frame_end := sdl.GetTicksNS()
+
+	npf_target := u64(1_000_000_000 / 60) // nanoseconds per frame target
+	if (frame_end - frame_start) < npf_target {
+		sleep_time := npf_target - (frame_end - frame_start)
+		sdl.DelayPrecise(sleep_time)
+		frame_end = sdl.GetTicksNS() // Update frame_end counter to include sleep_time for fps calculation
+	}
+
+	delta_time = f32(frame_end - frame_start) / 1_000_000_000
 
 	return .CONTINUE
 }
@@ -206,7 +195,7 @@ SDL_AppQuit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	sdl.Quit()
 }
 
-load_shader :: proc(code: []u8, stage: sdl.GPUShaderStage) -> ^sdl.GPUShader {
+load_shader :: proc(code: []u8, stage: sdl.GPUShaderStage, num_buffers: u32) -> ^sdl.GPUShader {
 	return sdl.CreateGPUShader(
 		device,
 		{
@@ -215,6 +204,7 @@ load_shader :: proc(code: []u8, stage: sdl.GPUShaderStage) -> ^sdl.GPUShader {
 			entrypoint = "main",
 			format = {.SPIRV},
 			stage = stage,
+			num_uniform_buffers = num_buffers,
 		},
 	)
 }
