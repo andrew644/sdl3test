@@ -1,8 +1,13 @@
+/*
+Follows the code from the odin sdl3 gpu videos by nadako
+*/
+
 package main
 
 import "base:runtime"
 import "core:c"
 import "core:math/linalg"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import sdl "vendor:sdl3"
@@ -10,6 +15,7 @@ import sdl "vendor:sdl3"
 device: ^sdl.GPUDevice
 window: ^sdl.Window
 pipeline: ^sdl.GPUGraphicsPipeline
+vertex_buf: ^sdl.GPUBuffer
 
 proj: matrix[4, 4]f32
 
@@ -49,7 +55,7 @@ main :: proc() {
 @(export)
 SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> sdl.AppResult {
 	context = runtime.default_context()
-	meta_ok := sdl.SetAppMetadata("Snake", "0.1", "snake in odin")
+	meta_ok := sdl.SetAppMetadata("sdl3test", "0.1", "sdl3 gpu test")
 	sdl_ok := sdl.Init({.VIDEO, .EVENTS})
 	if !meta_ok || !sdl_ok {
 		sdl.Log("Failed to initialize: %s", sdl.GetError())
@@ -76,12 +82,63 @@ SDL_AppInit :: proc "c" (appstate: ^rawptr, argc: c.int, cargv: [^]cstring) -> s
 	vert_shader := load_shader(vert_shader_code, .VERTEX, 1)
 	frag_shader := load_shader(frag_shader_code, .FRAGMENT, 0)
 
+	Vec3 :: [3]f32
+
+	Vertex_Data :: struct {
+		pos:   Vec3,
+		color: sdl.FColor,
+	}
+
+	verticies := []Vertex_Data {
+		{pos = {-0.5, -0.5, 0}, color = {1, 0, 0, 1}},
+		{pos = {0, 0.5, 0}, color = {0, 1, 0, 1}},
+		{pos = {0.5, -0.5, 0}, color = {0, 0, 1, 1}},
+	}
+	vertices_byte_size := len(verticies) * size_of(verticies[0])
+
+	vertex_buf = sdl.CreateGPUBuffer(device, {usage = {.VERTEX}, size = u32(vertices_byte_size)})
+
+	transfer_buf := sdl.CreateGPUTransferBuffer(
+		device,
+		{usage = .UPLOAD, size = u32(vertices_byte_size)},
+	)
+
+	transfer_mem := sdl.MapGPUTransferBuffer(device, transfer_buf, false)
+	mem.copy(transfer_mem, raw_data(verticies), vertices_byte_size)
+	sdl.UnmapGPUTransferBuffer(device, transfer_buf)
+
+	copy_cmd_buf := sdl.AcquireGPUCommandBuffer(device)
+	copy_pass := sdl.BeginGPUCopyPass(copy_cmd_buf)
+	sdl.UploadToGPUBuffer(
+		copy_pass,
+		{transfer_buffer = transfer_buf},
+		{buffer = vertex_buf, size = u32(vertices_byte_size)},
+		false,
+	)
+	sdl.EndGPUCopyPass(copy_pass)
+	ok := sdl.SubmitGPUCommandBuffer(copy_cmd_buf); assert(ok)
+	sdl.ReleaseGPUTransferBuffer(device, transfer_buf)
+
+	vertex_attrs := []sdl.GPUVertexAttribute {
+		{location = 0, format = .FLOAT3, offset = u32(offset_of(Vertex_Data, pos))},
+		{location = 1, format = .FLOAT4, offset = u32(offset_of(Vertex_Data, color))},
+	}
+
 	pipeline = sdl.CreateGPUGraphicsPipeline(
 		device,
 		{
 			vertex_shader = vert_shader,
 			fragment_shader = frag_shader,
 			primitive_type = .TRIANGLELIST,
+			vertex_input_state = {
+				num_vertex_buffers = 1,
+				vertex_buffer_descriptions = &(sdl.GPUVertexBufferDescription {
+						slot = 0,
+						pitch = size_of(Vertex_Data),
+					}),
+				num_vertex_attributes = u32(len(vertex_attrs)),
+				vertex_attributes = raw_data(vertex_attrs),
+			},
 			target_info = {
 				num_color_targets = 1,
 				color_target_descriptions = &(sdl.GPUColorTargetDescription {
@@ -156,6 +213,7 @@ SDL_AppIterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 		render_pass := sdl.BeginGPURenderPass(cmdBuf, &targetInfo, 1, nil)
 		sdl.BindGPUGraphicsPipeline(render_pass, pipeline)
+		sdl.BindGPUVertexBuffers(render_pass, 0, &(sdl.GPUBufferBinding{buffer = vertex_buf}), 1)
 		sdl.PushGPUVertexUniformData(cmdBuf, 0, &ubo, size_of(ubo))
 		sdl.DrawGPUPrimitives(render_pass, 3, 1, 0, 0)
 		sdl.EndGPURenderPass(render_pass)
